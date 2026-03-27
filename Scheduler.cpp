@@ -48,28 +48,66 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
+    bool gpu_capable = IsGPUCapable(task_id);
+    unsigned memory = GetMemory(task_id);
+    VMType_t vm = RequiredVMType(task_id);
+    SLAType_t sla =  RequiredSLA(task_id);
+    CPUType_t type = RequiredCPUType(task_id);
+
+    // priorities
+    Priority_t priority;
+    if (sla == SLA0) {
+        priority = HIGH_PRIORITY;
+    } else if (sla == SLA1) {
+        priority = MID_PRIORITY;
+    } else {
+        priority = LOW_PRIORITY;
+    }
     // Decide to attach the task to an existing VM, 
     //      vm.AddTask(taskid, Priority_T priority); or
+    for (unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t info = Machine_GetInfo(machines[i]);
+        if (info.memory_size - info.memory_used >= memory && info.cpu == type && info.s_state == S0) {
+            VM_AddTask(vms[i], task_id, priority);
+            return;
+        }
+    }
     // Create a new VM, attach the VM to a machine
     //      VM vm(type of the VM)
     //      vm.Attach(machine_id);
     //      vm.AddTask(taskid, Priority_t priority) or
+    for (unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t info = Machine_GetInfo(machines[i]);
+        if (info.s_state == S0 && info.cpu == type) {
+            VMId_t new_vm == VM_Create(vm, cpu);
+            VM_Attach(new_vm, machines[i]);
+            VM_AddTask(new_vm, task_id, priority);
+            return;
+        }
+    }
+
+    for (unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t info = Machine_GetInfo(machines[i]);
+        if (info.s_state != S0 && info.cpu == type) {
+            Machine_SetState(machines[i], S0); // waking it up!
+            VMId_t new_vm == VM_Create(vm, cpu);
+            VM_Attach(new_vm, machines[i]);
+            VM_AddTask(new_vm, task_id, priority);
+            return;
+        }
+    }
+
     // Turn on a machine, create a new VM, attach it to the VM, then add the task
     //
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
-    }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
+    // Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
+    // if(migrating) {
+    //     VM_AddTask(vms[0], task_id, priority);
+    // }
+    // else {
+    //     VM_(vms[task_id % active_machines], task_id, priority);
     }// Skeleton code, you need to change it according to your algorithm
 }
 
