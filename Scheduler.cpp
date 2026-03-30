@@ -6,6 +6,7 @@
 //
 
 #include "Scheduler.hpp"
+#include <map>
 
 static bool migrating = false;
 
@@ -33,6 +34,7 @@ void Scheduler::Init() {
     unsigned total_machines = Machine_GetTotal();
     for(unsigned i = 0; i < total_machines; i++) {
         machines.push_back(MachineId_t(i));
+    }
     
     for (unsigned i = 0; i < total_machines; i++) {
         MachineInfo_t info = Machine_GetInfo(machines[i]);
@@ -243,7 +245,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             VMId_t new_vm = VM_Create(pt.vm_type, pt.cpu_type);
             VM_Attach(new_vm, machine_id);
             VM_AddTask(new_vm, pt.task_id, pt.priority);
-            Scheduler.vms.push_back(new_vm);
+            Scheduler.AddVM(new_vm);
             SimOutput("StateChangeComplete(): Placed pending task " + to_string(pt.task_id) + " on machine " + to_string(machine_id), 3);
         }
         pending_tasks.erase(ready);
