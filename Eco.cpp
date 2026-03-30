@@ -25,7 +25,7 @@ void Scheduler::Init() {
     //      Get the memory of the machine
     //      Get the number of CPUs
     //      Get if there is a GPU or not
-    // 
+
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
 
@@ -62,10 +62,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Get the task parameters
     TaskInfo_t task = GetTaskInfo(task_id);
 
-    CPUType_t  required_cpu    = task.required_cpu;
-    VMType_t   required_vm     = task.required_vm;
-    unsigned   required_memory = task.required_memory;
-    SLAType_t  sla             = task.required_sla;
+    CPUType_t required_cpu = task.required_cpu;
+    VMType_t required_vm = task.required_vm;
+    unsigned required_memory = task.required_memory;
+    SLAType_t sla = task.required_sla;
 
     // priorities
     Priority_t priority;
@@ -150,6 +150,59 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+ 
+    const double OVERLOAD_THRESHOLD = 0.8;  // promote when avg utilization > 80%
+    const double UNDERLOAD_THRESHOLD = 0.2;  // demote when avg utilization < 20%
+
+    unsigned running_count = 0;
+    double total_util = 0.0;
+ 
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        if (info.s_state != S0) continue;
+ 
+        running_count++;
+        double util = (info.memory_size > 0) ? (double)info.memory_used / info.memory_size : 0.0;
+        total_util += util;
+    }
+ 
+    if (running_count == 0) return;
+    double avg_util = total_util / running_count;
+ 
+    SimOutput("PeriodicCheck(): Running machines=" + to_string(running_count) + " avg_util=" + to_string(avg_util), 3);
+ 
+    if (avg_util > OVERLOAD_THRESHOLD) {
+        for (MachineId_t machine_id : machines) {
+            MachineInfo_t info = Machine_GetInfo(machine_id);
+            if (info.s_state == S1 || info.s_state == S2) {
+                Machine_SetState(machine_id, S0);
+                SimOutput("PeriodicCheck(): Promoting machine " + to_string(machine_id) + " to running tier (overloaded)", 2);
+                break;  
+            }
+        }
+    }
+
+    if (avg_util < UNDERLOAD_THRESHOLD && running_count > 1) {
+        for (MachineId_t machine_id : machines) {
+            MachineInfo_t info = Machine_GetInfo(machine_id);
+            if (info.s_state != S0) continue;
+            if (info.active_tasks > 0) continue; 
+            if (info.active_vms > 0) continue; 
+ 
+            Machine_SetState(machine_id, S1);
+            SimOutput("PeriodicCheck(): Demoting machine " + to_string(machine_id) + " to intermediate tier (underloaded)", 2);
+            break;
+        }
+    }
+
+    for (MachineId_t machine_id : machines) {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        if (info.s_state != S1 && info.s_state != S2) continue;
+        if (info.active_tasks > 0 || info.active_vms > 0) continue;
+ 
+        Machine_SetState(machine_id, S5);
+        SimOutput("PeriodicCheck(): Powering off idle intermediate machine " + to_string(machine_id), 2);
+    }
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -226,7 +279,14 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): SLA violation for task " + to_string(task_id) + " at time " + to_string(time), 1);
-    
+    for (MachineId_t machine_id : Scheduler.machines) {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        if (info.s_state == S1 || info.s_state == S2) {
+            Machine_SetState(machine_id, S0);
+            SimOutput("SLAWarning(): Promoting machine " + to_string(machine_id) + " to running tier due to SLA pressure", 1);
+            break;
+        }
+    }
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {

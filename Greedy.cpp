@@ -16,6 +16,27 @@ struct PendingTask {
     Priority_t priority;
 };
 static map<MachineId_t, PendingTask> pending_tasks;
+static map<TaskId_t, VMId_t> task_to_vm;
+static map<MachineId_t, bool> transitioning;
+
+// utilization of a machine as fraction of memory used (0.0 - 1.0)
+static double MachineUtil(MachineId_t machine_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.memory_size == 0) return 0.0;
+    return (double)info.memory_used / info.memory_size;
+}
+
+// find a compatible VM on a given machine
+static VMId_t FindVMOnMachine(MachineId_t machine_id, CPUType_t cpu, VMType_t vm_type) {
+    for (VMId_t vm_id : Scheduler.vms) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if (vm_info.machine_id != machine_id) continue;
+        if (vm_info.cpu        != cpu)         continue;
+        if (vm_info.vm_type    != vm_type)     continue;
+        return vm_id;
+    }
+    return VMId_t(-1);  // not found
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -77,58 +98,61 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         priority = LOW_PRIORITY;
     }
 
-    // sara add to existing vm 
-    for (VMId_t vm_id : vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if (vm_info.cpu != required_cpu) continue;
-        if (vm_info.vm_type != required_vm) continue;
-        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-        if (machine_info.s_state != S0) continue;
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory) continue;
-        VM_AddTask(vm_id, task_id, priority);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " added to existing VM " + to_string(vm_id), 4);
-        return;
+    vector<MachineId_t> active;
+    for (MachineId_t m : machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.s_state != S0)
+            continue;
+        if (info.cpu != required_cpu) 
+            continue;
+        active.push_back(m);
+    }
+    sort(active.begin(), active.end(), [](MachineId_t a, MachineId_t b) {
+        return MachineUtil(a) > MachineUtil(b); 
+    });
+
+    for (MachineId_t machine_id : active) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        unsigned available_mem = machine_info.memory_size - machine_info.memory_used;
+        if (available_mem < required_memory) continue;
+
+        VMId_t vm_id = FindVMOnMachine(machine_id, required_cpu, required_vm);
+        if (vm_id != VMId_t(-1)) {
+            VM_AddTask(vm_id, task_id, priority);
+            task_to_vm[task_id] = vm_id;
+            SimOutput("Greedy::NewTask(): Task " + to_string(task_id) + " -> existing VM on machine " + to_string(machine_id), 4);
+            return;
+        }
+
+        if (available_mem >= required_memory + 8) {
+            VMId_t new_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(new_vm, machine_id);
+            VM_AddTask(new_vm, task_id, priority);
+            vms.push_back(new_vm);
+            task_to_vm[task_id] = new_vm;
+            SimOutput("Greedy::NewTask(): Task " + to_string(task_id) + " -> new VM on machine " + to_string(machine_id), 4);
+            return;
+        }
     }
 
-    // sara create new VM on active machine
     for (MachineId_t machine_id : machines) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state != S0) continue;
-        if (machine_info.cpu != required_cpu) continue;
+        if (machine_info.s_state == S0)        
+            continue;
+        if (machine_info.cpu != required_cpu) 
+            continue;
+        if (machine_info.memory_size < required_memory + 8)
+            continue;
+        if (transitioning.count(machine_id)) 
+            continue;
  
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory + 8) continue; 
- 
-        VMId_t new_vm = VM_Create(required_vm, required_cpu);
-        VM_Attach(new_vm, machine_id);
-        VM_AddTask(new_vm, task_id, priority);
-        vms.push_back(new_vm);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " placed on new VM on machine " + to_string(machine_id), 4);
-        return;
-    }
-
-    // sara 3 wake up machine
-    for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0) continue;         
-        if (machine_info.cpu != required_cpu) continue;
-        if (machine_info.memory_size < required_memory + 8) continue;
- 
-        PendingTask pt;
-        pt.vm_type = required_vm;
-        pt.cpu_type = required_cpu;
-        pt.task_id = task_id;
-        pt.priority = priority;
+        PendingTask pt = {required_vm, required_cpu, task_id, priority};
         pending_tasks[machine_id] = pt;
- 
+        transitioning[machine_id] = true;
         Machine_SetState(machine_id, S0);
-        SimOutput("Scheduler::NewTask(): Waking machine " + to_string(machine_id) + " for task " + to_string(task_id), 3);
+        SimOutput("Greedy::NewTask(): Waking machine " + to_string(machine_id) + " for task " + to_string(task_id), 3);
         return;
     }
-
-    // sara uh oh no machine
-    SimOutput("Scheduler::NewTask(): WARNING - no suitable machine found for task " + to_string(task_id), 0);
 
 }
 
@@ -144,6 +168,57 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // else {
     //     VM_(vms[task_id % active_machines], task_id, priority);
     // Skeleton code, you need to change it according to your algorithm
+
+//main
+void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
+    SimOutput("Greedy::TaskComplete(): Task " + to_string(task_id) + " done at " + to_string(now), 4);
+ 
+    task_to_vm.erase(task_id);
+ 
+    vector<MachineId_t> active;
+    for (MachineId_t m : machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.s_state == S0) active.push_back(m);
+    }
+    if (active.size() <= 1) return; 
+ 
+    sort(active.begin(), active.end(), [](MachineId_t a, MachineId_t b) {
+        return MachineUtil(a) < MachineUtil(b);
+    });
+
+    MachineId_t src = active.front();
+    MachineInfo_t src_info = Machine_GetInfo(src);
+    if (src_info.active_tasks == 0) {
+        Machine_SetState(src, S5);
+        SimOutput("Greedy::TaskComplete(): Turning off empty machine " + to_string(src), 2);
+        return;
+    }
+ 
+    for (VMId_t vm_id : vms) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if (vm_info.machine_id != src) continue;
+        if (vm_info.active_tasks.empty()) continue;
+ 
+        MachineInfo_t vm_machine_info = Machine_GetInfo(src);
+        unsigned vm_mem_needed = vm_machine_info.memory_used;  
+ 
+        for (int i = (int)active.size() - 1; i >= 1; i--) {
+            MachineId_t dest = active[i];
+            if (dest == src) continue;
+            MachineInfo_t dest_info = Machine_GetInfo(dest);
+            if (dest_info.cpu != src_info.cpu) continue;
+            if (dest_info.s_state != S0) continue;
+ 
+            unsigned dest_free = dest_info.memory_size - dest_info.memory_used;
+            if (dest_free < vm_mem_needed) continue;
+ 
+            VM_Migrate(vm_id, dst);
+            migrating = true;
+            SimOutput("Greedy::TaskComplete(): Migrating VM " + to_string(vm_id) + " from machine " + to_string(src) + " to machine "   + to_string(dst), 2);
+            return;
+        }
+    }
+}
 
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
@@ -226,6 +301,53 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): SLA violation for task " + to_string(task_id) + " at time " + to_string(time), 1);
+    auto it = task_to_vm.find(task_id);
+    if (it == task_to_vm.end()) return; 
+ 
+    VMId_t vm_id = it->second;
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    MachineId_t src = vm_info.machine_id;
+    MachineInfo_t src_info = Machine_GetInfo(src);
+
+    vector<MachineId_t> candidates;
+    for (MachineId_t m : Scheduler.machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (m == src)
+            continue;
+        if (info.s_state != S0)
+            continue;
+        if (info.cpu != src_info.cpu)   
+            continue;
+        candidates.push_back(m);
+    }
+    sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
+        return MachineUtil(a) < MachineUtil(b);
+    });
+ 
+    for (MachineId_t dest : candidates) {
+        MachineInfo_t dest_info = Machine_GetInfo(dest);
+        unsigned dest_free = dest_info.memory_size - dst_info.memory_used;
+        if (dest_free < src_info.memory_used) continue;
+ 
+        VM_Migrate(vm_id, dest);
+        migrating = true;
+        SimOutput("SLAWarning(): Migrating VM " + to_string(vm_id) + " from " + to_string(src) + " to " + to_string(dest) + " to relieve SLA pressure", 1);
+        return;
+    }
+
+    for (MachineId_t m : Scheduler.machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.s_state == S0) continue;
+        if (info.cpu != src_info.cpu) continue;
+        if (transitioning.count(m)) continue;
+ 
+        transitioning[m] = true;
+        Machine_SetState(m, S0);
+        SimOutput("SLAWarning(): Waking machine " + to_string(m) + " to relieve SLA pressure", 1);
+        return;
+    }
+ 
+    SimOutput("SLAWarning(): No relief available for task " + to_string(task_id), 0);
     
 }
 
