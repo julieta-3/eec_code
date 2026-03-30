@@ -7,8 +7,11 @@
 
 #include "Scheduler.hpp"
 #include <map>
+#include <algorithm>
 
 static bool migrating = false;
+
+static Scheduler Scheduler;
 
 struct PendingTask {
     VMType_t vm_type;
@@ -17,6 +20,12 @@ struct PendingTask {
     Priority_t priority;
 };
 static map<MachineId_t, PendingTask> pending_tasks;
+
+static double memPercentage(MachineId_t machine_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.memory_size == 0) return 0.0;
+    return (double)info.memory_used / info.memory_size;
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -79,48 +88,68 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         priority = LOW_PRIORITY;
     }
 
-    // sara add to existing vm 
-    for (VMId_t vm_id : vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if (vm_info.cpu != required_cpu) continue;
-        if (vm_info.vm_type != required_vm) continue;
-        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-        if (machine_info.s_state != S0) continue;
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory) continue;
-        VM_AddTask(vm_id, task_id, priority);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " added to existing VM " + to_string(vm_id), 4);
-        return;
+    vector<MachineId_t> candidates;
+    for (MachineId_t m : machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.s_state != S0)
+            continue;
+        if (info.cpu != required_cpu) 
+            continue;
+        unsigned mem_available = info.memory_size - info.memory_used;
+        if (mem_available < required_memory)   
+            continue;
+        candidates.push_back(m);
     }
 
-    // sara create new VM on active machine
-    for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state != S0) continue;
-        if (machine_info.cpu != required_cpu) continue;
- 
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory + 8) continue; 
- 
-        VMId_t new_vm = VM_Create(required_vm, required_cpu);
-        VM_Attach(new_vm, machine_id);
-        VM_AddTask(new_vm, task_id, priority);
-        vms.push_back(new_vm);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " placed on new VM on machine " + to_string(machine_id), 4);
-        return;
+    if (sla == SLA0 || sla == SLA1) {
+        sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
+            return memPercentage(a) < memPercentage(b);  
+        });
+    } else {
+        sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
+            return memPercentage(a) > memPercentage(b);  
+        });
     }
 
-    // sara 3 wake up machine
+    for (MachineId_t machine_id : candidates) {
+        for (VMId_t vm_id : vms) {
+            VMInfo_t vm_info = VM_GetInfo(vm_id);
+            if (vm_info.machine_id != machine_id)  
+                continue;
+            if (vm_info.cpu != required_cpu) 
+                continue;
+            if (vm_info.vm_type != required_vm)  
+                continue;
+ 
+            VM_AddTask(vm_id, task_id, priority);
+            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " added to existing VM " + to_string(vm_id), 4);
+            return;
+        }
+ 
+        MachineInfo_t minfo = Machine_GetInfo(machine_id);
+        unsigned available_mem = minfo.memory_size - minfo.memory_used;
+        if (available_mem >= required_memory + 8) {
+            VMId_t new_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(new_vm, machine_id);
+            VM_AddTask(new_vm, task_id, priority);
+            vms.push_back(new_vm);
+            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " on new VM on machine " + to_string(machine_id), 4);
+            return;
+        }
+    }
+
     for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0) continue;         
-        if (machine_info.cpu != required_cpu) continue;
-        if (machine_info.memory_size < required_memory + 8) continue;
+        MachineInfo_t mem_info = Machine_GetInfo(machine_id);
+        if (mem_info.s_state == S0)           
+            continue;
+        if (mem_info.cpu != required_cpu) 
+            continue;
+        if (mem_info.memory_size < required_memory + 8) continue;
  
         PendingTask pt;
-        pt.vm_type = required_vm;
+        pt.vm_type  = required_vm;
         pt.cpu_type = required_cpu;
-        pt.task_id = task_id;
+        pt.task_id  = task_id;
         pt.priority = priority;
         pending_tasks[machine_id] = pt;
  
@@ -128,10 +157,8 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         SimOutput("Scheduler::NewTask(): Waking machine " + to_string(machine_id) + " for task " + to_string(task_id), 3);
         return;
     }
-
-    // sara uh oh no machine
+ 
     SimOutput("Scheduler::NewTask(): WARNING - no suitable machine found for task " + to_string(task_id), 0);
-
 }
 
     // Turn on a machine, create a new VM, attach it to the VM, then add the task
@@ -177,8 +204,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 }
 
 // Public interface below
-
-static Scheduler Scheduler;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
@@ -228,7 +253,19 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): SLA violation for task " + to_string(task_id) + " at time " + to_string(time), 1);
-    
+    SetTaskPriority(task_id, HIGH_PRIORITY);
+    TaskInfo_t task = GetTaskInfo(task_id);
+    for (MachineId_t machine_id : Scheduler.machines) {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        if (info.s_state == S0) 
+            continue;
+        if (info.cpu != task.required_cpu) 
+            continue;
+ 
+        Machine_SetState(machine_id, S0);
+        SimOutput("SLAWarning(): Waking machine " + to_string(machine_id) + " due to SLA pressure", 1);
+        break;
+    }
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {

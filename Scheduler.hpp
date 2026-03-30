@@ -22,7 +22,7 @@ public:
     void Shutdown(Time_t now);
     void TaskComplete(Time_t now, TaskId_t task_id);
     void AddVM(VMId_t vm) { vms.push_back(vm); }
-private:
+    
     vector<VMId_t> vms;
     vector<MachineId_t> machines;
 };
