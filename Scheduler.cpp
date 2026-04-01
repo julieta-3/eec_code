@@ -282,7 +282,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
             VMId_t new_vm = VM_Create(pt.vm_type, pt.cpu_type);
             VM_Attach(new_vm, machine_id);
             VM_AddTask(new_vm, pt.task_id, pt.priority);
-            Scheduler.AddVM(new_vm);
+            Scheduler.vms.push_back(new_vm);
             SimOutput("StateChangeComplete(): Placed pending task " + to_string(pt.task_id) + " on machine " + to_string(machine_id), 3);
         }
         pending_tasks.erase(ready);

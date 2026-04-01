@@ -6,6 +6,8 @@
 //
 
 #include "Scheduler.hpp"
+#include <map>     
+#include <algorithm>
 
 static bool migrating = false;
 
@@ -16,6 +18,14 @@ struct PendingTask {
     Priority_t priority;
 };
 static map<MachineId_t, PendingTask> pending_tasks;
+
+static Scheduler Scheduler;
+
+static double MemPercentage(MachineId_t machine_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.memory_size == 0) return 0.0;
+    return (double)info.memory_used / info.memory_size;
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -33,6 +43,7 @@ void Scheduler::Init() {
     unsigned total_machines = Machine_GetTotal();
     for(unsigned i = 0; i < total_machines; i++) {
         machines.push_back(MachineId_t(i));
+    }
     
     for (unsigned i = 0; i < total_machines; i++) {
         MachineInfo_t info = Machine_GetInfo(machines[i]);
@@ -77,48 +88,66 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         priority = LOW_PRIORITY;
     }
 
-    // sara add to existing vm 
-    for (VMId_t vm_id : vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if (vm_info.cpu != required_cpu) continue;
-        if (vm_info.vm_type != required_vm) continue;
-        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
-        if (machine_info.s_state != S0) continue;
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory) continue;
-        VM_AddTask(vm_id, task_id, priority);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " added to existing VM " + to_string(vm_id), 4);
-        return;
+    vector<MachineId_t> candidates;
+    for (MachineId_t m : machines) {
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.s_state != S0)           continue;
+        if (info.cpu     != required_cpu) continue;
+        unsigned mem_available = info.memory_size - info.memory_used;
+        if (mem_available < required_memory)   continue;
+        candidates.push_back(m);
     }
 
-    // sara create new VM on active machine
-    for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state != S0) continue;
-        if (machine_info.cpu != required_cpu) continue;
+    if (sla == SLA0 || sla == SLA1) {
+        sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
+            return MemPercentage(a) < MemPercentage(b);
+        });
+    } else {
+        sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
+            return MemPercentage(a) > MemPercentage(b); 
+        });
+    }
  
-        unsigned mem_available = machine_info.memory_size - machine_info.memory_used;
-        if (mem_available < required_memory + 8) continue; 
- 
-        VMId_t new_vm = VM_Create(required_vm, required_cpu);
-        VM_Attach(new_vm, machine_id);
-        VM_AddTask(new_vm, task_id, priority);
-        vms.push_back(new_vm);
-        SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " placed on new VM on machine " + to_string(machine_id), 4);
-        return;
+    for (MachineId_t machine_id : candidates) {
+        for (VMId_t vm_id : vms) {
+            VMInfo_t vm_info = VM_GetInfo(vm_id);
+            if (vm_info.machine_id != machine_id)   
+                continue;
+            if (vm_info.cpu        != required_cpu)  
+                continue;
+            if (vm_info.vm_type    != required_vm)   
+                continue;
+
+            VM_AddTask(vm_id, task_id, priority);
+            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " added to existing VM " + to_string(vm_id), 4);
+            return;
+        }
+
+        MachineInfo_t mem_info = Machine_GetInfo(machine_id);
+        unsigned mem_available = mem_info.memory_size - mem_info.memory_used;
+        if (mem_available >= required_memory + 8) {
+            VMId_t new_vm = VM_Create(required_vm, required_cpu);
+            VM_Attach(new_vm, machine_id);
+            VM_AddTask(new_vm, task_id, priority);
+            vms.push_back(new_vm);
+            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " on new VM on machine " + to_string(machine_id), 4);
+            return;
+        }
     }
 
-    // sara 3 wake up machine
     for (MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0) continue;         
-        if (machine_info.cpu != required_cpu) continue;
-        if (machine_info.memory_size < required_memory + 8) continue;
- 
+        MachineInfo_t mem_info = Machine_GetInfo(machine_id);
+        if (mem_info.s_state == S0)           
+            continue;
+        if (mem_info.cpu != required_cpu) 
+            continue;
+        if (mem_info.memory_size < required_memory + 8) 
+            continue;
+
         PendingTask pt;
-        pt.vm_type = required_vm;
+        pt.vm_type  = required_vm;
         pt.cpu_type = required_cpu;
-        pt.task_id = task_id;
+        pt.task_id  = task_id;
         pt.priority = priority;
         pending_tasks[machine_id] = pt;
  
@@ -126,11 +155,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         SimOutput("Scheduler::NewTask(): Waking machine " + to_string(machine_id) + " for task " + to_string(task_id), 3);
         return;
     }
-
-    // sara uh oh no machine
+ 
     SimOutput("Scheduler::NewTask(): WARNING - no suitable machine found for task " + to_string(task_id), 0);
-
-}
+}  
 
     // Turn on a machine, create a new VM, attach it to the VM, then add the task
     //
@@ -154,22 +181,22 @@ void Scheduler::PeriodicCheck(Time_t now) {
     const double OVERLOAD_THRESHOLD = 0.8;  // promote when avg utilization > 80%
     const double UNDERLOAD_THRESHOLD = 0.2;  // demote when avg utilization < 20%
 
-    unsigned running_count = 0;
+    unsigned running = 0;
     double total_util = 0.0;
  
     for (MachineId_t machine_id : machines) {
         MachineInfo_t info = Machine_GetInfo(machine_id);
         if (info.s_state != S0) continue;
  
-        running_count++;
+        running++;
         double util = (info.memory_size > 0) ? (double)info.memory_used / info.memory_size : 0.0;
         total_util += util;
     }
  
-    if (running_count == 0) return;
-    double avg_util = total_util / running_count;
+    if (running == 0) return;
+    double avg_util = total_util / running;
  
-    SimOutput("PeriodicCheck(): Running machines=" + to_string(running_count) + " avg_util=" + to_string(avg_util), 3);
+    SimOutput("PeriodicCheck(): Running machines=" + to_string(running) + " avg_util=" + to_string(avg_util), 3);
  
     if (avg_util > OVERLOAD_THRESHOLD) {
         for (MachineId_t machine_id : machines) {
@@ -182,12 +209,15 @@ void Scheduler::PeriodicCheck(Time_t now) {
         }
     }
 
-    if (avg_util < UNDERLOAD_THRESHOLD && running_count > 1) {
+    if (avg_util < UNDERLOAD_THRESHOLD && running > 1) {
         for (MachineId_t machine_id : machines) {
             MachineInfo_t info = Machine_GetInfo(machine_id);
-            if (info.s_state != S0) continue;
-            if (info.active_tasks > 0) continue; 
-            if (info.active_vms > 0) continue; 
+            if (info.s_state != S0) 
+                continue;
+            if (info.active_tasks > 0) 
+                continue; 
+            if (info.active_vms > 0) 
+                continue; 
  
             Machine_SetState(machine_id, S1);
             SimOutput("PeriodicCheck(): Demoting machine " + to_string(machine_id) + " to intermediate tier (underloaded)", 2);
@@ -197,8 +227,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
 
     for (MachineId_t machine_id : machines) {
         MachineInfo_t info = Machine_GetInfo(machine_id);
-        if (info.s_state != S1 && info.s_state != S2) continue;
-        if (info.active_tasks > 0 || info.active_vms > 0) continue;
+        if (info.s_state != S1 && info.s_state != S2) 
+            continue;
+        if (info.active_tasks > 0 || info.active_vms > 0) 
+            continue;
  
         Machine_SetState(machine_id, S5);
         SimOutput("PeriodicCheck(): Powering off idle intermediate machine " + to_string(machine_id), 2);
@@ -228,8 +260,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 }
 
 // Public interface below
-
-static Scheduler Scheduler;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
@@ -279,11 +309,13 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): SLA violation for task " + to_string(task_id) + " at time " + to_string(time), 1);
+    
+    SetTaskPriority(task_id, HIGH_PRIORITY);
     for (MachineId_t machine_id : Scheduler.machines) {
         MachineInfo_t info = Machine_GetInfo(machine_id);
         if (info.s_state == S1 || info.s_state == S2) {
             Machine_SetState(machine_id, S0);
-            SimOutput("SLAWarning(): Promoting machine " + to_string(machine_id) + " to running tier due to SLA pressure", 1);
+            SimOutput("SLAWarning(): Promoting machine " + to_string(machine_id) + " due to SLA pressure", 1);
             break;
         }
     }
