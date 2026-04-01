@@ -135,7 +135,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             vms.push_back(new_vm);
             SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " on new VM on machine " + to_string(machine_id), 4);
             return;
-        }
+        }  
     }
 
     for (MachineId_t machine_id : machines) {
