@@ -1,334 +1,225 @@
+// min min algorithm
 
-
-// Greedy Algorithm
 #include "Scheduler.hpp"
 #include <map>
-#include <algorithm>
+#include <set>
  
+static Scheduler scheduler;
+ 
+// Tasks waiting to be placed once a machine finishes waking up
 struct PendingTask {
     VMType_t vm_type;
     CPUType_t cpu_type;
     TaskId_t task_id;
     Priority_t priority;
 };
- 
-static map<MachineId_t, PendingTask> pending_tasks;
-static map<TaskId_t, VMId_t> task_to_vm;
-static map<MachineId_t, bool> transitioning;
-static map<VMId_t, bool> vm_migrating; // VM between machines
-static map<MachineId_t, bool> shutting_down;
-static map<VMId_t, bool> vm_shutdown; 
-static map<CPUType_t, unsigned> tasks_seen;
-static map<MachineId_t, unsigned> migration_dest_count; // in progress of migrating
- 
-static const unsigned MAX_TASKS_PER_VM = 2;
-static const unsigned MAX_TASKS_SLA0 = 1;
-static const unsigned MIN_ACTIVE_PER_CPU = 4;
- 
-static Scheduler* sched = nullptr;
+
+static map<MachineId_t, vector<PendingTask>> pending_tasks;
+static set<MachineId_t> waking_machines;
  
 
- // for sorting machines
-static double machine_util(MachineId_t m) {
-    MachineInfo_t info = Machine_GetInfo(m);
-    if (info.memory_size == 0) return 0.0;
-    return (double)info.memory_used / info.memory_size;
+ 
+static Priority_t sla_to_priority(SLAType_t sla) {
+    if (sla == SLA0) return HIGH_PRIORITY;
+    if (sla == SLA1) return MID_PRIORITY;
+    return LOW_PRIORITY;
 }
  
- // find a VM with the least load but still upder the cap
-static VMId_t find_vm(MachineId_t machine_id, CPUType_t cpu, VMType_t vm_type, unsigned cap) {
-    VMId_t best = VMId_t(-1); // will return this if not found 
-    unsigned best_n = cap + 1;
-    for (VMId_t vm : sched->vms) {
-        if (vm_shutdown.count(vm)  && vm_shutdown[vm]) continue;
-        if (vm_migrating.count(vm) && vm_migrating[vm]) continue;
-        VMInfo_t info = VM_GetInfo(vm);
-        if (info.machine_id != machine_id) continue;
-        if (info.cpu != cpu) continue;
-        if (info.vm_type != vm_type) continue;
-        unsigned n = info.active_tasks.size();
-        if (n >= cap) continue;
-        if (n < best_n) { best_n = n; best = vm; } 
+
+// estimate time it will take to complete task,
+static double est_completion(MachineId_t mid, uint64_t instructions) {
+    MachineInfo_t info = Machine_GetInfo(mid);
+    if (info.performance.empty()) return 0;
+ 
+    double mips = info.performance[P0]; // use full speed for fair comparison
+    if (mips == 0) return 0;
+
+    double cores  = info.num_cpus;
+    double active = info.active_tasks;
+    if (active > cores) {
+        mips = mips * cores / active;
     }
-    return best;
-}
- 
- // attach the VM to machine, safety checks for sleeping machines!
-static bool attach_vm(VMId_t vm, MachineId_t m) {
-    if (shutting_down.count(m)) return false;
-    if (migration_dest_count.count(m) && migration_dest_count[m] > 0) return false;
-    if (Machine_GetInfo(m).s_state != S0) return false;
-    VM_Attach(vm, m);
-    return true;
-}
- 
- // move VM to other machine, lots of checks for no crashes
-static bool migrate_vm(VMId_t vm, MachineId_t dest) {
-    if (vm_migrating.count(vm) && vm_migrating[vm]) return false;
-    if (vm_shutdown.count(vm)  && vm_shutdown[vm]) return false;
-    VMInfo_t vi = VM_GetInfo(vm);
-    if (vi.machine_id == dest) return false;
-    if (vi.active_tasks.empty()) return false; // nothing to migrate
-    if (shutting_down.count(dest)) return false;
-    if (transitioning.count(dest)) return false; // still waking up, can't move yet
-    MachineInfo_t di = Machine_GetInfo(dest);
-    if (di.s_state != S0) return false;
-    if (di.cpu != vi.cpu) return false;
-    
-    // if machine is idle, don't migrate because may be shut off by the time migration finishes
-    if (di.active_tasks == 0 && di.memory_used <= 8) return false;
-    MachineInfo_t si = Machine_GetInfo(vi.machine_id);
-    if (di.memory_size - di.memory_used < si.memory_used) return false;
-    VM_Migrate(vm, dest);
-    vm_migrating[vm] = true;
-    migration_dest_count[dest]++;
-    return true;
-}
- 
-static void shutdown_vm(VMId_t vm) {
-    if (vm_shutdown.count(vm) && vm_shutdown[vm]) return;
-    if (!VM_GetInfo(vm).active_tasks.empty()) return;
-    vm_shutdown[vm] = true;
-    VM_Shutdown(vm);
-}
- 
-static unsigned num_active_machines(CPUType_t cpu) {
-    unsigned n = 0;
-    for (MachineId_t m : sched->machines) {
-        if (shutting_down.count(m)) continue;
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (info.s_state == S0 && info.cpu == cpu) n++;
-    }
-    return n;
-}
  
 
- // don't shutdown unless passes the checks
-static bool shutdown_ready(MachineId_t m) {
-    if (shutting_down.count(m)) return false; // in process of going to sleep
-    if (pending_tasks.count(m)) return false;// still has tasks queued
-    if (transitioning.count(m)) return false; // currently changing state
-    if (migration_dest_count.count(m) && migration_dest_count[m] > 0) return false;
-    MachineInfo_t info = Machine_GetInfo(m);
-
-    if (info.active_tasks > 0) return false; // runing tasks
-    if (tasks_seen[info.cpu] == 0) return false; 
-
-    // check that there aren't any VMs or currently migrating 
-    if (num_active_machines(info.cpu) <= MIN_ACTIVE_PER_CPU) return false;
-    for (VMId_t vm : sched->vms) {
-        if (vm_shutdown.count(vm) && vm_shutdown[vm]) continue;
-        VMInfo_t vi = VM_GetInfo(vm);
-        if (vi.machine_id != m) continue;
-        if (!vi.active_tasks.empty()) return false;
-        if (vm_migrating.count(vm) && vm_migrating[vm]) return false;
-    }
-    return true;
+    return (double)instructions / mips;
 }
  
+// find compatible VM that meets requirements
+static bool find_vm(MachineId_t machine_id, VMType_t vm_type, CPUType_t cpu,
+                  vector<VMId_t>& vms, VMId_t& out_vm) {
 
-// place task on a machine, sort so best first
-static bool place_task(TaskId_t task_id, CPUType_t cpu, VMType_t vm_type,
-                  unsigned mem, Priority_t priority, SLAType_t sla, unsigned cap) {
-    vector<MachineId_t> active;
-    for (MachineId_t m : sched->machines) {
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (info.s_state != S0) continue;
-        if (info.cpu != cpu) continue;
-        if (shutting_down.count(m)) continue;
-        active.push_back(m);
-    }
-
-
-    //SLA0 on empty machines, task gets full CPU util of machine
-    // SLAs sort by tasks count followd by mem. util.
-    sort(active.begin(), active.end(), [sla](MachineId_t a, MachineId_t b) {
-        MachineInfo_t a_info = Machine_GetInfo(a);
-        MachineInfo_t b_info = Machine_GetInfo(b);
-        if (sla == SLA0) {
-            bool a_empty = (a_info.active_tasks == 0);
-            bool b_empty = (b_info.active_tasks == 0);
-            if (a_empty != b_empty) return a_empty > b_empty;
-        }
-        if (a_info.active_tasks != b_info.active_tasks)
-            return a_info.active_tasks < b_info.active_tasks;
-        return machine_util(a) < machine_util(b);
-    });
-
-    for (MachineId_t m : active) {
-        MachineInfo_t mi = Machine_GetInfo(m);
-        unsigned free = mi.memory_size - mi.memory_used;
-        if (free < mem) continue;
-        VMId_t vm = find_vm(m, cpu, vm_type, cap);
-        if (vm != VMId_t(-1)) {
-            VM_AddTask(vm, task_id, priority);
-            task_to_vm[task_id] = vm;
+    // check if already exists
+    for (VMId_t vm_id : vms) {
+        VMInfo_t info = VM_GetInfo(vm_id);
+        if (info.machine_id == machine_id &&
+            info.cpu == cpu &&
+            info.vm_type == vm_type) {
+            out_vm = vm_id;
             return true;
         }
+    }
 
-        // no reusable VM so make new one but has overhead
-        if (free >= mem + 8) {
-            VMId_t nvm = VM_Create(vm_type, cpu);
-            if (!attach_vm(nvm, m)) continue;
-            VM_AddTask(nvm, task_id, priority);
-            sched->vms.push_back(nvm);
-            task_to_vm[task_id] = nvm;
-            return true;
-        }
+    // create new VM if can't find one
+    MachineInfo_t minfo = Machine_GetInfo(machine_id);
+    if (minfo.memory_size - minfo.memory_used >= 8) {
+        out_vm = VM_Create(vm_type, cpu);
+        VM_Attach(out_vm, machine_id);
+        vms.push_back(out_vm);
+        return true;
     }
     return false;
 }
  
+
  
 void Scheduler::Init() {
     unsigned total = Machine_GetTotal();
-    SimOutput("Scheduler::Init(): total machines = " + to_string(total), 0);
-    for (unsigned i = 0; i < total; i++)
+    for (unsigned i = 0; i < total; i++) {
         machines.push_back(MachineId_t(i));
-    SimOutput("Scheduler::Init(): done", 0);
-}
+    }
+
+    for (MachineId_t mid : machines) {
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.s_state == S0) {
+            VMType_t vm_type = (info.cpu == POWER) ? AIX : LINUX;
+            VMId_t vm = VM_Create(vm_type, info.cpu);
+            VM_Attach(vm, mid);
+            vms.push_back(vm);
+        }
+    }
  
-void Scheduler::MigrationComplete(Time_t time, VMId_t vm) {
-    vm_migrating[vm] = false;
-    VMInfo_t info = VM_GetInfo(vm);
-    if (migration_dest_count.count(info.machine_id) && migration_dest_count[info.machine_id] > 0)
-        migration_dest_count[info.machine_id]--;
+    SimOutput("Scheduler::Init(): " + to_string(machines.size()) +
+              " machines, " + to_string(vms.size()) + " VMs", 1);
 }
  
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     TaskInfo_t task = GetTaskInfo(task_id);
-    CPUType_t cpu = task.required_cpu;
-    VMType_t vmt = task.required_vm;
-    unsigned mem = task.required_memory;
-    SLAType_t sla = task.required_sla;
-    Priority_t pri = (sla == SLA0) ? HIGH_PRIORITY :
-                      (sla == SLA1) ? MID_PRIORITY  : LOW_PRIORITY;
-    tasks_seen[cpu]++;
+    CPUType_t req_cpu = task.required_cpu;
+    VMType_t req_vm = task.required_vm;
+    unsigned req_mem = task.required_memory;
+    Priority_t priority = sla_to_priority(task.required_sla);
  
-        // machine already awake
-    unsigned cap = (sla == SLA0) ? MAX_TASKS_SLA0 : MAX_TASKS_PER_VM;
-    if (place_task(task_id, cpu, vmt, mem, pri, sla, cap)) return;
+   // min min search
+    bool found = false;
+    MachineId_t best = machines[0]; // placeholder, only used when found=true
+    double best_time = 0;
+ 
+    for (MachineId_t mid : machines) {
+        MachineInfo_t info = Machine_GetInfo(mid);
+        //machine must be awake and CPU must match
+        if (info.s_state != S0) continue; 
+        if (info.cpu != req_cpu) continue;
+
+        // need enough memory
+        unsigned free_mem = (info.memory_size > info.memory_used)
+                            ? info.memory_size - info.memory_used : 0;
+        if (free_mem < req_mem + 8) continue; // 8 MB VM overhead
+ 
+        double t = est_completion(mid, task.total_instructions);
+        if (t == 0) continue; // invalid machine, skip
  
 
-    // wake up a machine and queue task for once it is awake
-    for (MachineId_t m : machines) {
-        MachineInfo_t mi = Machine_GetInfo(m);
-        if (mi.s_state == S0) continue; // awake
-        if (mi.cpu != cpu) continue;
-        if (mi.memory_size < mem + 8) continue;
-        if (transitioning.count(m)) continue; 
-        if (shutting_down.count(m)) continue;
-        pending_tasks[m] = {vmt, cpu, task_id, pri};
-        transitioning[m] = true;
-        Machine_SetState(m, S0);
-        return;
-    }
-
-    // machine w/ no pending task yet
-    for (MachineId_t m : machines) {
-        MachineInfo_t mi = Machine_GetInfo(m);
-        if (mi.cpu != cpu) continue;
-        if (!transitioning.count(m)) continue;
-        if (shutting_down.count(m)) continue;
-        if (pending_tasks.count(m)) continue;
-        if (mi.memory_size < mem + 8) continue;
-        pending_tasks[m] = {vmt, cpu, task_id, pri};
-        return;
-    }
-    
-    // at capacity, relax until place is found
-    for (unsigned fallback = MAX_TASKS_PER_VM + 1; fallback <= 8; fallback++) {
-        if (place_task(task_id, cpu, vmt, mem, pri, sla, fallback)) return;
+        // need machine w/ smallest completion time
+        if (!found || t < best_time) {
+            found  = true;
+            best_time = t;
+            best  = mid;
+        }
     }
  
-    SimOutput("NewTask(): WARNING could not place task " + to_string(task_id), 0);
+
+    // assign to the best
+    if (found) {
+        VMId_t vm;
+        if (find_vm(best, req_vm, req_cpu, vms, vm)) {
+            VM_AddTask(vm, task_id, priority);
+            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) +
+                      " -> machine " + to_string(best), 4);
+            return;
+        }
+    }
+ 
+    // no awake ones available so wake machine
+    for (MachineId_t mid : machines) {
+        if (waking_machines.count(mid)) continue;
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.s_state == S0) continue;
+        if (info.cpu != req_cpu) continue;
+        if (info.memory_size < req_mem + 8) continue;
+ 
+        pending_tasks[mid].push_back({req_vm, req_cpu, task_id, priority});
+        waking_machines.insert(mid);
+        Machine_SetState(mid, S0);
+        SimOutput("Scheduler::NewTask(): Waking machine " + to_string(mid) +
+                  " for task " + to_string(task_id), 3);
+        return;
+    }
+ 
+    // put on machine that is alredy waking up
+    for (MachineId_t mid : machines) {
+        if (!waking_machines.count(mid)) continue;
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.cpu != req_cpu) continue;
+        if (info.memory_size < req_mem + 8) continue;
+        pending_tasks[mid].push_back({req_vm, req_cpu, task_id, priority});
+        SimOutput("Scheduler::NewTask(): Queued task " + to_string(task_id) +
+                  " on waking machine " + to_string(mid), 3);
+        return;
+    }
+ 
+    SimOutput("Scheduler::NewTask(): WARNING - no machine found for task " +
+              to_string(task_id), 0);
 }
-
-
  
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    task_to_vm.erase(task_id);
-    
-    // only shut down if the minimum is met
-    vector<MachineId_t> active;
-    for (MachineId_t m : machines) {
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (info.s_state == S0 && !shutting_down.count(m))
-            active.push_back(m);
-    }
-    if (active.size() <= MIN_ACTIVE_PER_CPU) return;
- 
-    // shut down least loaded to save energy
-    sort(active.begin(), active.end(), [](MachineId_t a, MachineId_t b) {
-        return machine_util(a) < machine_util(b);
-    });
-
-    MachineId_t src = active.front();
-    if (shutdown_ready(src)) {
-        for (VMId_t vm : vms) {
-            if (vm_shutdown.count(vm) && vm_shutdown[vm]) continue;
-            VMInfo_t vi = VM_GetInfo(vm);
-            if (vi.machine_id != src) continue;
-            if (!vi.active_tasks.empty()) continue;
-            shutdown_vm(vm);
-        }
-        shutting_down[src] = true;
-        Machine_SetState(src, S5);
-    }
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
+              " done at " + to_string(now), 4);
 }
  
-void Scheduler::PeriodicCheck(Time_t now) {}
+void Scheduler::PeriodicCheck(Time_t now) {
+
+}
+ 
+void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
+    SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) +
+              " done at " + to_string(time), 3);
+}
  
 void Scheduler::Shutdown(Time_t time) {
-    for (VMId_t vm : vms) shutdown_vm(vm);
-    SimOutput("Shutdown(): done at " + to_string(time), 4);
+    for (VMId_t vm : vms) {
+        try {
+            VMInfo_t info = VM_GetInfo(vm);
+            if (info.active_tasks.empty()) VM_Shutdown(vm);
+        } catch (...) {}
+    }
 }
+ 
 
  
 void InitScheduler() {
-    SimOutput("InitScheduler(): starting", 0);
-    sched = new Scheduler();
-    sched->Init();
+    scheduler.Init();
 }
  
-void HandleNewTask(Time_t time, TaskId_t task_id) { sched->NewTask(time, task_id); }
-void HandleTaskCompletion(Time_t time, TaskId_t task_id) { sched->TaskComplete(time, task_id); }
+void HandleNewTask(Time_t time, TaskId_t task_id) {
+    scheduler.NewTask(time, task_id);
+}
  
-
+void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
+    scheduler.TaskComplete(time, task_id);
+}
+ 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    static map<MachineId_t, Time_t> last_handled;
-    if (last_handled.count(machine_id) && last_handled[machine_id] == time) return;
-    last_handled[machine_id] = time;
-    MachineInfo_t src_info = Machine_GetInfo(machine_id);
-    vector<MachineId_t> candidates;
-    for (MachineId_t m : sched->machines) {
-        if (m == machine_id) continue;
-        if (shutting_down.count(m)) continue;
-        if (transitioning.count(m)) continue;
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (info.s_state != S0) continue;
-        if (info.cpu != src_info.cpu) continue;
-        candidates.push_back(m);
-    }
-    sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
-        return machine_util(a) < machine_util(b);
-    });
-
-
-    // overloaded so migrate the VM
-    for (VMId_t vm : sched->vms) {
-        if (vm_shutdown.count(vm) && vm_shutdown[vm]) continue;
-        if (vm_migrating.count(vm) && vm_migrating[vm]) continue;
-        VMInfo_t vi = VM_GetInfo(vm);
-        if (vi.machine_id != machine_id) continue;
-        if (vi.active_tasks.empty()) continue;
-        for (MachineId_t dest : candidates)
-            if (migrate_vm(vm, dest)) return;
-    }
+    SimOutput("MemoryWarning(): Machine " + to_string(machine_id) +
+              " overcommitted at " + to_string(time), 0);
 }
  
-void MigrationDone(Time_t time, VMId_t vm_id) { sched->MigrationComplete(time, vm_id); }
-void SchedulerCheck(Time_t time) { sched->PeriodicCheck(time); }
+void MigrationDone(Time_t time, VMId_t vm_id) {
+    scheduler.MigrationComplete(time, vm_id);
+}
+ 
+void SchedulerCheck(Time_t time) {
+    scheduler.PeriodicCheck(time);
+}
  
 void SimulationComplete(Time_t time) {
     cout << "SLA violation report" << endl;
@@ -336,87 +227,35 @@ void SimulationComplete(Time_t time) {
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
     cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << " KW-Hour" << endl;
-    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    sched->Shutdown(time);
+    cout << "Simulation run finished in " << double(time) / 1000000 << " seconds" << endl;
+    scheduler.Shutdown(time);
 }
  
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    auto it = task_to_vm.find(task_id);
-    if (it == task_to_vm.end()) return;
-    VMId_t vm = it->second;
-    if (vm_shutdown.count(vm)  && vm_shutdown[vm])  return;
-    if (vm_migrating.count(vm) && vm_migrating[vm]) return;
-
-    // increase priority
+    // Bump the priority of the violating task so it gets more CPU time
     SetTaskPriority(task_id, HIGH_PRIORITY);
-
-    // SLA2 deadline
-    TaskInfo_t ti = GetTaskInfo(task_id);
-    if (ti.required_sla == SLA2) return;  // migration too slow for SLA2
-
-    // SLA0/1 migrate to less-loaded
-    VMInfo_t vi = VM_GetInfo(vm);
-    MachineId_t src = vi.machine_id;
-    MachineInfo_t si = Machine_GetInfo(src);
-
-    vector<MachineId_t> candidates;
-    for (MachineId_t m : sched->machines) {
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (m == src)                continue;
-        if (info.s_state != S0)      continue;
-        if (shutting_down.count(m))  continue;
-        if (transitioning.count(m))  continue;
-        if (info.cpu != si.cpu)      continue;
-        candidates.push_back(m);
-    }
-
-    sort(candidates.begin(), candidates.end(), [](MachineId_t a, MachineId_t b) {
-        return machine_util(a) < machine_util(b);
-    });
-
-
-    for (MachineId_t dest : candidates)
-        if (migrate_vm(vm, dest)) return;
-
-    // no active active available so wake one up
-    for (MachineId_t m : sched->machines) {
-        MachineInfo_t info = Machine_GetInfo(m);
-        if (info.s_state == S0) continue;
-        if (info.cpu != si.cpu) continue;
-        if (transitioning.count(m)) continue;
-        if (shutting_down.count(m)) continue;
-        transitioning[m] = true;
-        Machine_SetState(m, S0);
-        return;
-    }
 }
  
+
+ // once awake, place tasks that were queued
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    MachineInfo_t minfo = Machine_GetInfo(machine_id);
-    if (minfo.s_state != S0) {
-        // start clean up
-        shutting_down.erase(machine_id);
-        transitioning.erase(machine_id);
-        return;
-    }
-
-
-    transitioning.erase(machine_id);
-    shutting_down.erase(machine_id);
+    waking_machines.erase(machine_id);
+ 
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.s_state != S0) return; // was a sleep transition, nothing to do
+ 
+    // machine now awake so send out tasks
     auto it = pending_tasks.find(machine_id);
     if (it == pending_tasks.end()) return;
-    PendingTask& pt = it->second;
-
-    // make sure state hasn't changed
-    if (Machine_GetInfo(machine_id).s_state != S0 || shutting_down.count(machine_id)) {
-        pending_tasks.erase(it);
-        return;
-    }
-    VMId_t nvm = VM_Create(pt.vm_type, pt.cpu_type);
-    if (attach_vm(nvm, machine_id)) {
-        VM_AddTask(nvm, pt.task_id, pt.priority);
-        sched->vms.push_back(nvm);
-        task_to_vm[pt.task_id] = nvm;
+ 
+    for (PendingTask& pt : it->second) {
+        VMId_t vm;
+        if (find_vm(machine_id, pt.vm_type, pt.cpu_type, scheduler.vms, vm)) {
+            VM_AddTask(vm, pt.task_id, pt.priority);
+            SimOutput("StateChangeComplete(): Placed task " + to_string(pt.task_id) +
+                      " on machine " + to_string(machine_id), 3);
+        }
     }
     pending_tasks.erase(it);
 }
+ 
