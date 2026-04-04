@@ -92,7 +92,7 @@ static bool migrate_vm(VMId_t vm, MachineId_t dest) {
     if (dest_info.active_tasks == 0 && dest_info.memory_used <= 8) return false;
 
     MachineInfo_t info = Machine_GetInfo(vm_info.machine_id);
-    if (dest_info.memory_size - dest_info.memory_used < dest_info.memory_used) return false;
+    if (dest_info.memory_size - dest_info.memory_used < info.memory_used) return false;
     VM_Migrate(vm, dest);
     vm_migrating[vm] = true;
     migration_dest_count[dest]++;
@@ -132,8 +132,8 @@ static bool shutdown_ready(MachineId_t m) {
         if (vm_shutdown.count(vm) && vm_shutdown[vm]) continue;
         VMInfo_t vm_info = VM_GetInfo(vm);
         if (vm_info.machine_id != m) continue;
-        if (!vm_info.active_tasks.empty()) return false;
-        if (vm_migrating.count(vm) && vm_migrating[vm]) return false;
+        if (!vm_info.active_tasks.empty() || (vm_migrating.count(vm) && vm_migrating[vm])) return false;
+        // if (vm_migrating.count(vm) && vm_migrating[vm]) return false;
     }
     return true;
 }
@@ -237,7 +237,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     for (MachineId_t m : machines) {
         MachineInfo_t m_info = Machine_GetInfo(m);
         if (m_info.cpu != cpu) continue;
-        if (!transitioning.count(m) || shutting_down.count(m) || pending_tasks.count(m)) continue;
+        if (shutting_down.count(m) || pending_tasks.count(m)) continue;
         if (m_info.memory_size < mem + 8) continue;
         pending_tasks[m] = {vmt, cpu, task_id, pri};
         return;
@@ -306,6 +306,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
     static map<MachineId_t, Time_t> last_handled;
     if (last_handled.count(machine_id) && last_handled[machine_id] == time) return;
     last_handled[machine_id] = time;
+    
     MachineInfo_t src_info = Machine_GetInfo(machine_id);
     vector<MachineId_t> candidates;
     for (MachineId_t m : sched->machines) {
