@@ -1,4 +1,3 @@
-// min min algorithm
 
 #include "Scheduler.hpp"
 #include <map>
@@ -17,9 +16,8 @@ struct PendingTask {
 static map<MachineId_t, vector<PendingTask>> pending_tasks;
 static set<MachineId_t> waking_machines;
  
-
  
-static Priority_t sla_to_priority(SLAType_t sla) {
+static Priority_t set_priority(SLAType_t sla) {
     if (sla == SLA0) return HIGH_PRIORITY;
     if (sla == SLA1) return MID_PRIORITY;
     return LOW_PRIORITY;
@@ -33,7 +31,6 @@ static double est_completion(MachineId_t mid, uint64_t instructions) {
  
     double mips = info.performance[P0]; // use full speed for fair comparison
     if (mips == 0) return 0;
-
     double cores  = info.num_cpus;
     double active = info.active_tasks;
     if (active > cores) {
@@ -97,7 +94,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     CPUType_t req_cpu = task.required_cpu;
     VMType_t req_vm = task.required_vm;
     unsigned req_mem = task.required_memory;
-    Priority_t priority = sla_to_priority(task.required_sla);
+    Priority_t priority = set_priority(task.required_sla);
  
    // min min search
     bool found = false;
@@ -107,8 +104,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     for (MachineId_t mid : machines) {
         MachineInfo_t info = Machine_GetInfo(mid);
         //machine must be awake and CPU must match
-        if (info.s_state != S0) continue; 
-        if (info.cpu != req_cpu) continue;
+        if (info.s_state != S0 || info.cpu != req_cpu) continue; 
 
         // need enough memory
         unsigned free_mem = (info.memory_size > info.memory_used)
@@ -143,9 +139,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     for (MachineId_t mid : machines) {
         if (waking_machines.count(mid)) continue;
         MachineInfo_t info = Machine_GetInfo(mid);
-        if (info.s_state == S0) continue;
-        if (info.cpu != req_cpu) continue;
-        if (info.memory_size < req_mem + 8) continue;
+        if (info.s_state == S0 || info.cpu != req_cpu || info.memory_size < req_mem + 8) continue;
  
         pending_tasks[mid].push_back({req_vm, req_cpu, task_id, priority});
         waking_machines.insert(mid);
@@ -159,8 +153,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     for (MachineId_t mid : machines) {
         if (!waking_machines.count(mid)) continue;
         MachineInfo_t info = Machine_GetInfo(mid);
-        if (info.cpu != req_cpu) continue;
-        if (info.memory_size < req_mem + 8) continue;
+        if (info.cpu != req_cpu || info.memory_size < req_mem + 8) continue;
         pending_tasks[mid].push_back({req_vm, req_cpu, task_id, priority});
         SimOutput("Scheduler::NewTask(): Queued task " + to_string(task_id) +
                   " on waking machine " + to_string(mid), 3);
@@ -187,10 +180,8 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
  
 void Scheduler::Shutdown(Time_t time) {
     for (VMId_t vm : vms) {
-        try {
-            VMInfo_t info = VM_GetInfo(vm);
-            if (info.active_tasks.empty()) VM_Shutdown(vm);
-        } catch (...) {}
+        VMInfo_t info = VM_GetInfo(vm);
+        if (info.active_tasks.empty()) VM_Shutdown(vm);
     }
 }
  
